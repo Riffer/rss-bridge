@@ -9,6 +9,7 @@ class GoComicsBridge extends BridgeAbstract
     const NAME = 'GoComics Unofficial RSS';
     const URI = 'https://www.gocomics.com/';
     const CACHE_TIMEOUT = 21600; // 6h
+    const CIRCUIT_BREAKER_TIMEOUT = 21600; // 6h
     const DESCRIPTION = 'The Unofficial GoComics RSS';
     const PARAMETERS = [ [
         'comicname' => [
@@ -32,23 +33,28 @@ class GoComicsBridge extends BridgeAbstract
 
     public function collectData()
     {
+        $retryAt = $this->loadCacheValue('circuit_breaker');
+        if (is_int($retryAt)) {
+            throwRateLimitException($this->getCircuitBreakerMessage($retryAt));
+        }
+        if ($retryAt) {
+            throwRateLimitException('GoComics requests are paused after a temporary block. Please retry later.');
+        }
+
+        try {
+            $this->collectDataInternal();
+        } catch (HttpException $e) {
+            $this->handleHttpException($e);
+        }
+    }
+
+    private function collectDataInternal(): void
+    {
         $link = $this->getURI();
         $header = [
             'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36'
         ];
-        try {
-            $landingpage = getSimpleHTMLDOM($link, $header);
-        } catch (HttpException $e) {
-            if ($e->getCode() === 403) {
-                throw new \Exception(<<<'MSG'
-                    The server returned 403 Forbidden.  
-                    This is likely GoComics\' use of Bunny Shield blocking requests from this bridge.  Try reducing your feed update 
-                    frequency, running your own RSS-Bridge instance, or hosting an instance from a different IP/location.
-                    MSG
-                    , 403);
-            }
-            throw $e;
-        }
+        $landingpage = getSimpleHTMLDOM($link, $header);
 
         $element = $landingpage->find('div[data-post-url]', 0);
         $comicFound = false;
@@ -120,6 +126,63 @@ class GoComicsBridge extends BridgeAbstract
             }
             $link = rtrim(self::URI, '/') . $button_previous->href;
         }
+    }
+
+    private function handleHttpException(HttpException $e): void
+    {
+        if ($e->getCode() !== 403 && $e->getCode() !== 429) {
+            throw $e;
+        }
+
+        $timeout = $this->getCircuitBreakerTimeout($e);
+        $retryAt = time() + $timeout;
+        $this->saveCacheValue('circuit_breaker', $retryAt, $timeout);
+
+        if ($e->getCode() === 403) {
+            $message = <<<'MSG'
+                The server returned 403 Forbidden.
+                This is likely GoComics' use of Bunny Shield blocking requests from this bridge. Try reducing your feed update
+                frequency, running your own RSS-Bridge instance, or hosting an instance from a different IP/location.
+                MSG;
+            throw new \Exception($message . ' ' . $this->getCircuitBreakerMessage($retryAt), 403);
+        }
+
+        throwRateLimitException('The server returned 429 Too Many Requests. ' . $this->getCircuitBreakerMessage($retryAt));
+    }
+
+    private function getCircuitBreakerMessage(int $retryAt): string
+    {
+        $retryAtUtc = gmdate('Y-m-d H:i:s', $retryAt);
+        $remaining = max(0, $retryAt - time());
+
+        return sprintf('GoComics requests are paused until %s UTC (about %d seconds remaining).', $retryAtUtc, $remaining);
+    }
+
+    private function getCircuitBreakerTimeout(HttpException $e): int
+    {
+        if ($e->getCode() !== 429) {
+            return self::CIRCUIT_BREAKER_TIMEOUT;
+        }
+
+        $retryAfter = $e->response?->getHeader('retry-after');
+        if (!is_string($retryAfter)) {
+            return self::CIRCUIT_BREAKER_TIMEOUT;
+        }
+
+        if (ctype_digit($retryAfter) && (int) $retryAfter > 0) {
+            return (int) $retryAfter;
+        }
+
+        $retryAt = DateTimeImmutable::createFromFormat(DATE_RFC7231, $retryAfter, new DateTimeZone('GMT'));
+        $errors = DateTimeImmutable::getLastErrors();
+        if ($retryAt && ($errors === false || ($errors['warning_count'] === 0 && $errors['error_count'] === 0))) {
+            $timeout = $retryAt->getTimestamp() - time();
+            if ($timeout > 0) {
+                return $timeout;
+            }
+        }
+
+        return self::CIRCUIT_BREAKER_TIMEOUT;
     }
 
     public function getURI()
