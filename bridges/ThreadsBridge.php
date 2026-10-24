@@ -3,7 +3,7 @@
 class ThreadsBridge extends BridgeAbstract
 {
     const NAME = 'Threads';
-    const URI = 'https://www.threads.net/';
+    const URI = 'https://www.threads.com/';
     const DESCRIPTION = 'Say more with Threads &#x2014; Instagram&#039;s new text app.';
     const MAINTAINER = 'mdemoss';
     const CACHE_TIMEOUT = 3600;
